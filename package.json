@@ -1,0 +1,23 @@
+{
+  "name": "koishi-plugin-gouqi-novelai-generate-image",
+  "description": "Generating image using NovelAI",
+  "version": "0.0.9",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "dist"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.18.7"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  }
+}
