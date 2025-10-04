@@ -7,14 +7,14 @@ export const name = 'gouqi-novelai-generate-image'
 export interface Config {
   rpxy_url: string,
   token: string,
-  model: 'nai-diffusion-3' | 'nai-diffusion-4-full',
+  model: any,
   additional_prompt: string,
   negative_prompt: string,
   steps: number,
   strength: any,
   allow_image: boolean,
   collapse_response: boolean,
-  translate_input: boolean,
+  translate_model: any
 }
 
 export const Config: Schema<Config> = Schema.intersect([Schema.object({
@@ -27,47 +27,13 @@ export const Config: Schema<Config> = Schema.intersect([Schema.object({
   strength: Schema.tuple([Schema.number().default(0.88), Schema.number().default(0.93)]).description('strength，越高ai发挥的空间就越多'),
   allow_image: Schema.boolean().default(true).description('是否允许图生图'),
   collapse_response: Schema.boolean().default(true).description('折叠回复'),
-  translate_input: Schema.boolean().default(false).description('翻译输入')
+  translate_model: Schema.union(['none', 'default_translator', 'translator_yd'] as const).role('radio').default('none').description("翻译模型")
 }).description("画图设置")]);
 
 export const inject = {
-  required: ["http"],
-  optional: ["translator"]
+  required: ['http', 'gouqi_base'],
+  optional: ['translator']
 };
-
-function hasSensitiveWords(input) {
-  const lowercaseInput = input.toLowerCase();
-  const nsfwKeywords = [
-    "nsfw",
-    "nude",
-    "porn",
-    "hentai",
-    "ecchi",
-    "gore",
-    "violence",
-    "rape",
-    "incest",
-    "pedophile",
-    "pussy",
-    "cock",
-    "dick",
-    "vagina",
-    "penis",
-    "ass",
-    "boobs",
-    "tits",
-    "cum",
-    "anal",
-    "masturbation",
-    //  ... 这里可以添加更多你认为相关的关键词 ...
-  ];
-  for (const keyword of nsfwKeywords) {
-    if (lowercaseInput.includes(keyword)) {
-      return true;
-    }
-  }
-  return false;
-}
 
 function forceDataPrefix(url, mime = "image/png") {
   if (url.startsWith("data:")) return url;
@@ -92,8 +58,9 @@ async function downloadImage(ctx, url, headers = {}) {
 }
 
 export function apply(ctx: Context, config) {
-  let paramsTextToImg, paramsImgToImg, paramsTextToImgV4, paramsImgToImgV4;
+
   function initParams() {
+    let paramsTextToImg, paramsImgToImg, paramsTextToImgV4, paramsImgToImgV4;
     // 注意为了重置随机数，apply之应用一次
     paramsTextToImg = {
       input: 'octopus, best quality, amazing quality, very aesthetic, absurdres',
@@ -156,8 +123,6 @@ export function apply(ctx: Context, config) {
         image: undefined
       }
     }
-
-
     paramsTextToImgV4 = {
       input: 'octopus, best quality, amazing quality, very aesthetic, absurdres',
       model: 'nai-diffusion-4-full',
@@ -191,7 +156,6 @@ export function apply(ctx: Context, config) {
         v4_negative_prompt: {}
       }
     }
-
     paramsTextToImgV4.parameters.v4_prompt = {
       caption: { base_caption: paramsTextToImgV4.input, char_captions: [] },
       use_coords: false,
@@ -242,19 +206,26 @@ export function apply(ctx: Context, config) {
         char_captions: [],
       }
     };
-
+    return {
+      paramsTextToImg: paramsTextToImg, paramsImgToImg: paramsImgToImg,
+      paramsTextToImgV4: paramsTextToImgV4, paramsImgToImgV4: paramsImgToImgV4
+    }
   }
 
 
 
   async function generateImage({ session, options: options2 }, input) {
     // 重置随机数
-    initParams();
+    let initObj = initParams();
+    let paramsTextToImg = initObj['paramsTextToImg'];
+    let paramsImgToImg = initObj['paramsImgToImg'];
+    let paramsTextToImgV4 = initObj['paramsTextToImgV4'];
+    let paramsImgToImgV4 = initObj['paramsImgToImgV4'];
     try {
       if (!config.token) {
         return '没有token';
       }
-      if (hasSensitiveWords(input)) {
+      if (ctx['gouqi_base'].hasSensitiveWords(input)) {
         //提时含有敏感词
         const bot = session.bot;
         try {
@@ -268,16 +239,23 @@ export function apply(ctx: Context, config) {
       if (!config.allow_image && h.select(input, 'img').length) {
         throw new SessionError("不允许输入图片");
       }
-
-      if (session.app['translator'] && config.translate_input) {
-        try {
-          input = await session.app['translator'].translate({ input, target: "en" });
-          //console.log("翻译后的提示词");
-          //console.log(input);
-        } catch (err) {
-          ctx.logger.warn(err);
+      let textMerged = ctx['gouqi_base'].getMergedText(input);
+      if (config.translate_model == 'default_translator') {
+        if (session.app['translator']) {
+          try {
+            textMerged = await session.app['translator'].translate({ textMerged, target: "en" });
+            //console.log("翻译后的提示词");
+            //console.log(input);
+          } catch (err) {
+            ctx.logger.warn(err);
+          }
+        }
+      } else if (config.translate_model == 'translator_yd') {
+        if (ctx['gouqi_base'].hasChinese(textMerged)) {
+          textMerged = await ctx['gouqi_base'].translate_yd(textMerged);
         }
       }
+
       let imgUrl, image;
       let imgList = h.select(input, 'img').map((item) => h.image(item.attrs.src));
       // [
@@ -290,53 +268,51 @@ export function apply(ctx: Context, config) {
       //   }
       // ]
       //console.log(imgList);
-      if (imgList.length > 1) {
-        throw new SessionError("图片数量过多");
-      }
+      let atList = h.select(input, 'at').map((item) => h.text(item.attrs.id));
       if (imgList.length) {
         imgUrl = imgList[0].attrs.src;
         try {
           image = await downloadImage(ctx, imgUrl);
           //console.log(image.base64)
         } catch (err) {
-          console.log(err)
+          ctx.logger.error(err);
+          return 'Download error';
+        }
+      } else if (atList.length) {
+        try {
+          let atId = atList[0];
+          image = await ctx['gouqi_base'].getAvatar64(atId);
+        } catch (err) {
           ctx.logger.error(err);
           return 'Download error';
         }
       }
-      let textList = h.select(input, 'text').map((item) => h.text(item.attrs.content));
-      // [
-      //   Element { type: 'text', attrs: { content: '马斯里 ' }, children: [] },
-      //   Element { type: 'text', attrs: { content: ' 玛丽苏' }, children: [] }
-      // ]
-      //console.log(textList);
-      let textPromt = '';
-      textList.map(item => { textPromt += item.attrs.content });
+      let textPromt = textMerged;
       session.send("很快很快...");
       let paramsToSend;
-
       if (config.model == 'nai-diffusion-4-full') {
         //v4
         if (image) {
           paramsToSend = paramsImgToImgV4;
           paramsToSend.parameters.image = image?.base64;
         } else {
-          paramsToSend = paramsTextToImg;
+          paramsToSend = paramsTextToImgV4;
         }
+        //prompt
         paramsToSend.input = textPromt + ',' + config.additional_prompt;
-        paramsToSend.parameters.strength = config.strength[0] + Math.random() * (config.strength[1] - config.strength[0]);
-        paramsToSend.parameters.strength = parseFloat(paramsToSend.parameters.strength.toFixed(3));
-        console.log(paramsToSend.parameters.strength);
+        //negative_prompt
+        paramsToSend.negative_prompt = config.negative_prompt;
+        paramsToSend.parameters.steps = config.steps;
+        //strength
+        let strength = config.strength[0] + Math.random() * (config.strength[1] - config.strength[0]);
+        paramsToSend.parameters.strength = parseFloat(strength.toFixed(3));
         if (options2.hasOwnProperty('s')) {
           paramsToSend.parameters.strength = parseFloat(options2.s);
         }
         if (options2.hasOwnProperty('strength')) {
           paramsToSend.parameters.strength = parseFloat(options2.strength);
         }
-        //negative_prompt
-        paramsToSend.negative_prompt = config.negative_prompt;
-        paramsToSend.parameters.steps = config.steps;
-
+        ctx.logger.info('strength: ' + paramsToSend.parameters.strength);
         paramsToSend.parameters.v4_prompt = {
           caption: { base_caption: paramsToSend.input, char_captions: [] },
           use_coords: false,
@@ -356,18 +332,22 @@ export function apply(ctx: Context, config) {
         } else {
           paramsToSend = paramsTextToImg;
         }
+
+        //prompt
         paramsToSend.input = textPromt + ',' + config.additional_prompt;
-        paramsToSend.parameters.strength = config.strength[0] + Math.random() * (config.strength[1] - config.strength[0]);
-        paramsToSend.parameters.strength = parseFloat(paramsToSend.parameters.strength.toFixed(3));
+        //negative_prompt
+        paramsToSend.negative_prompt = config.negative_prompt;
+        paramsToSend.parameters.steps = config.steps;
+        //strength
+        let strength = config.strength[0] + Math.random() * (config.strength[1] - config.strength[0]);
+        paramsToSend.parameters.strength = parseFloat(strength.toFixed(3));
         if (options2.hasOwnProperty('s')) {
           paramsToSend.parameters.strength = parseFloat(options2.s);
         }
         if (options2.hasOwnProperty('strength')) {
           paramsToSend.parameters.strength = parseFloat(options2.strength);
         }
-        //negative_prompt
-        paramsToSend.negative_prompt = config.negative_prompt;
-        paramsToSend.parameters.steps = config.steps;
+        ctx.logger.info('strength: ' + paramsToSend.parameters.strength);
       }
 
       const headers = {
@@ -383,7 +363,7 @@ export function apply(ctx: Context, config) {
           {
             method: "POST",
             //timeout: config.requestTimeout,
-            timeout: 9900000,
+            timeout: 990000,
             // Since novelai's latest interface returns an application/x-zip-compressed, a responseType must be passed in
             //responseType: config.type === "naifu" ? "text" : ["login", "token"].includes(config.type) ? "arraybuffer" : "json",
             responseType: "arraybuffer",
@@ -420,11 +400,11 @@ export function apply(ctx: Context, config) {
         }
       }
       catch (error) {
-        console.log(error)
-        return "发生错误"
+        ctx.logger.error(error)
+        return "发生错误: " + error.message;
       }
     } catch (error) {
-      console.log(error);
+      ctx.logger.error(error);
       session.send("发生错误");
     }
   }
@@ -441,11 +421,11 @@ export function apply(ctx: Context, config) {
     .action(async ({ session }) => {
       await session.send('请输入标题')
       const title = await session.prompt(20000);
-      if (!title.trim()) return `粗口`
+      if (!title || !title.trim()) return `粗口`
       await session.send('请输入图片');
       const img = h.select(await session.prompt(20000) || '', 'img').map(img => img.attrs.src);
       if (!img.length) return `粗口`
-      console.log(img);
+      ctx.logger.error(img);
       return h.image(img[0]) + title
     }
     );
