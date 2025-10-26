@@ -27,7 +27,8 @@ export const Config: Schema<Config> = Schema.intersect([Schema.object({
   strength: Schema.tuple([Schema.number().default(0.88), Schema.number().default(0.93)]).description('strength，越高ai发挥的空间就越多'),
   allow_image: Schema.boolean().default(true).description('是否允许图生图'),
   collapse_response: Schema.boolean().default(true).description('折叠回复'),
-  translate_model: Schema.union(['none', 'default_translator', 'translator_yd'] as const).role('radio').default('none').description("翻译模型")
+  translate_model: Schema.union(['none', 'default_translator', 'translator_yd'] as const).role('radio').default('none').description("翻译模型"),
+  resize_image: Schema.boolean().default(false).description('发送图片前是否调整图片宽高')
 }).description("画图设置")]);
 
 export const inject = {
@@ -61,7 +62,7 @@ export function apply(ctx: Context, config) {
 
   function initParams() {
     let paramsTextToImg, paramsImgToImg, paramsTextToImgV4, paramsImgToImgV4;
-    // 注意为了重置随机数，apply之应用一次
+    // 注意为了重置随机数，放到apply里面只应用一次
     paramsTextToImg = {
       input: 'octopus, best quality, amazing quality, very aesthetic, absurdres',
       model: 'nai-diffusion-3',
@@ -212,7 +213,61 @@ export function apply(ctx: Context, config) {
     }
   }
 
+  /**
+ * 根据特定规则计算新的图片尺寸
+ * 规则1: 如果宽或高小于MIN_DIMENSION，则按比例放大，确保最小边等于MIN_DIMENSION
+ * 规则2: 如果宽或高大于MAX_DIMENSION，则按比例缩小，确保最大边等于MAX_DIMENSION
+ * 规则3: 否则，尺寸保持不变
+ *
+ * @param {number} originalWidth 原始宽度
+ * @param {number} originalHeight 原始高度
+ * @returns {{width: number, height: number}} 包含新宽度和新高度的对象
+ */
+  function calculateNewDimensions(originalWidth, originalHeight) {
+    const MIN_DIMENSION = 600;
+    const MAX_DIMENSION = 1200;
 
+    let newWidth = originalWidth;
+    let newHeight = originalHeight;
+
+    // 规则1: 需要放大
+    if (originalWidth < MIN_DIMENSION || originalHeight < MIN_DIMENSION) {
+      let ratio;
+      // 基于更小的那条边来计算缩放比例
+      if (originalWidth < originalHeight) {
+        ratio = MIN_DIMENSION / originalWidth;
+      } else {
+        ratio = MIN_DIMENSION / originalHeight;
+      }
+      newWidth = Math.round(originalWidth * ratio);
+      newHeight = Math.round(originalHeight * ratio);
+    }
+    // 规则2: 需要缩小 (使用 else if 是因为放大和缩小是互斥的)
+    else if (originalWidth > MAX_DIMENSION || originalHeight > MAX_DIMENSION) {
+      let ratio;
+      // 基于更大的那条边来计算缩放比例
+      if (originalWidth > originalHeight) {
+        ratio = MAX_DIMENSION / originalWidth;
+      } else {
+        ratio = MAX_DIMENSION / originalHeight;
+      }
+      newWidth = Math.round(originalWidth * ratio);
+      newHeight = Math.round(originalHeight * ratio);
+    }
+    // 新增的规则3: 尺寸在[MIN, MAX]范围内，但需要根据短边调整
+    else {
+      const shorterSide = Math.min(originalWidth, originalHeight);
+
+      // 如果较短的一条边大于MIN_DIMENSION，就按照比例，将它改为MIN_DIMENSION
+      if (shorterSide > MIN_DIMENSION) {
+        const ratio = MIN_DIMENSION / shorterSide;
+        newWidth = Math.round(originalWidth * ratio);
+        newHeight = Math.round(originalHeight * ratio);
+      }
+      // 规则4: 如果shorterSide正好等于MIN_DIMENSION，则尺寸保持不变
+    }
+    return { width: newWidth, height: newHeight };
+  }
 
   async function generateImage({ session, options: options2 }, input) {
     // 重置随机数
@@ -256,7 +311,7 @@ export function apply(ctx: Context, config) {
         }
       }
 
-      let imgUrl, image;
+      let imgUrl, image, imageB64;
       let imgList = h.select(input, 'img').map((item) => h.image(item.attrs.src));
       // [
       //   Element {
@@ -273,6 +328,7 @@ export function apply(ctx: Context, config) {
         imgUrl = imgList[0].attrs.src;
         try {
           image = await downloadImage(ctx, imgUrl);
+          imageB64 = image?.base64;
           //console.log(image.base64)
         } catch (err) {
           ctx.logger.error(err);
@@ -282,11 +338,28 @@ export function apply(ctx: Context, config) {
         try {
           let atId = atList[0];
           image = await ctx['gouqi_base'].getAvatar64(atId);
+          imageB64 = image?.base64;
         } catch (err) {
           ctx.logger.error(err);
           return 'Download error';
         }
       }
+      if (image && config.resize_image) {
+        let origDimensions = ctx['gouqi_base'].getImage64Dimensions(image.dataUrl);
+        const newDimensions = calculateNewDimensions(origDimensions.width, origDimensions.height);
+        if (
+          (newDimensions.width < 599 || newDimensions.width > 1200) ||
+          (newDimensions.height < 599 || newDimensions.height > 1200)
+        ) {
+          throw new Error('无法适配图片尺寸');
+        }
+        const resizedImage64 = await ctx['gouqi_base'].resizeImage64(image.dataUrl, newDimensions.width, newDimensions.height);
+        const parts = resizedImage64.split(";");
+        const mimeType = parts[0].split(":")[1];
+        imageB64 = parts[1].split(",")[1];
+      }
+      //console.log(imageB64.slice(0,10))
+      //console.log(image.base64.slice(0,10))
       let textPromt = textMerged;
       session.send("很快很快...");
       let paramsToSend;
@@ -294,7 +367,7 @@ export function apply(ctx: Context, config) {
         //v4
         if (image) {
           paramsToSend = paramsImgToImgV4;
-          paramsToSend.parameters.image = image?.base64;
+          paramsToSend.parameters.image = imageB64;
         } else {
           paramsToSend = paramsTextToImgV4;
         }
@@ -328,7 +401,7 @@ export function apply(ctx: Context, config) {
         //v3
         if (image) {
           paramsToSend = paramsImgToImg;
-          paramsToSend.parameters.image = image?.base64;
+          paramsToSend.parameters.image = imageB64;
         } else {
           paramsToSend = paramsTextToImg;
         }
