@@ -307,7 +307,12 @@ export function apply(ctx: Context, config) {
         }
       } else if (config.translate_model == 'translator_yd') {
         if (ctx['gouqi_base'].hasChinese(textMerged)) {
-          textMerged = await ctx['gouqi_base'].translate_yd(textMerged);
+          let simpleTranslateInfo = ctx['gouqi_base'].simpleTranslate(textMerged);
+          if (simpleTranslateInfo.translated) {
+            textMerged = simpleTranslateInfo.result;
+          } else {
+            textMerged = await ctx['gouqi_base'].translate_yd(textMerged);
+          }
         }
       }
 
